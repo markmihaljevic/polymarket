@@ -4,7 +4,7 @@ Web app that surfaces **Polymarket** sports markets priced above **Pinnacle's** 
 value — i.e., +EV opportunities. Covers soccer, tennis, NFL, NHL, and NBA.
 
 Built with Next.js 15 (App Router) + Tailwind, deployed on Vercel Pro, refreshed by Vercel Cron,
-cached in Upstash Redis (via the Vercel Marketplace integration).
+cached in Next.js's built-in Data Cache (no external database required).
 
 ## How it works
 
@@ -20,10 +20,10 @@ cached in Upstash Redis (via the Vercel Marketplace integration).
                          ├── match events (team-name fuzzy + ±6h)
                          ├── de-vig Pinnacle (multiplicative)
                          ├── compare PM price vs fair prob
-                         └── write snapshot to Upstash Redis
+                         └── revalidate Next.js Data Cache
                                 │
                                 ▼
-                         /api/snapshot  ◀── page polls every 30s
+                         /api/snapshot  ◀── page polls every 60s
 ```
 
 Only rows where **PM implied probability < Pinnacle de-vigged probability**
@@ -49,23 +49,26 @@ Visit [http://localhost:3000](http://localhost:3000).
 
 ## Deploying to Vercel
 
-1. **Import the repo** into Vercel. Framework preset: Next.js.
-2. **Provision a Redis store**: Vercel dashboard → Storage → Marketplace → Upstash Redis. Create
-   a free database and link it to this project; `KV_REST_API_URL` / `KV_REST_API_TOKEN` (or the
-   `UPSTASH_REDIS_REST_*` equivalents) are injected automatically.
-3. **Set environment variables**:
-   - `ODDS_API_KEY` — your [the-odds-api.com](https://the-odds-api.com/) key
-   - `CRON_SECRET` — any random string; Vercel Cron sends it as `Authorization: Bearer <value>`
+1. **Import the repo** into Vercel. Framework preset: Next.js. No database/storage provisioning
+   needed — the app caches snapshots in Vercel's built-in Next.js Data Cache.
+2. **Set environment variables** under Project Settings → Environment Variables:
+   - `ODDS_API_KEY` — **required**, your [the-odds-api.com](https://the-odds-api.com/) key
+   - `CRON_SECRET` — optional; if set, Vercel Cron auto-sends `Authorization: Bearer <value>`
    - (optional) `NEXT_PUBLIC_MIN_EDGE` — default minimum edge, e.g. `0.02`
    - (optional) `ODDS_API_SPORTS_OVERRIDE` — comma-separated sport keys to force-include
-4. **Deploy**. `vercel.json` already declares the cron (`*/5 * * * *` on `/api/cron/refresh`).
-5. After the first deploy, Vercel will hit the cron within ~5 minutes; until then `/api/snapshot`
-   returns `503`. You can kick off the first refresh manually from the Vercel dashboard
-   (Deployments → latest → Functions → `/api/cron/refresh` → Invoke) or with curl:
+3. **Deploy**. `vercel.json` already declares the cron (`*/5 * * * *` on `/api/cron/refresh`).
+4. Visit the site. The first `/api/snapshot` call after deploy builds the snapshot inline (10–20s)
+   and caches it; every subsequent request is served from the Data Cache until the cron invalidates
+   it again.
+5. You can force a refresh at any time with the **Refresh now** button in the UI, or via curl:
 
    ```bash
-   curl https://<your-vercel-domain>/api/cron/refresh \
-     -H "Authorization: Bearer $CRON_SECRET"
+   # With CRON_SECRET set:
+   curl "https://<your-domain>/api/cron/refresh?key=$CRON_SECRET"
+   # Or with header form:
+   curl -H "Authorization: Bearer $CRON_SECRET" https://<your-domain>/api/cron/refresh
+   # With no CRON_SECRET:
+   curl https://<your-domain>/api/cron/refresh
    ```
 
 ## Odds API quota planning
@@ -102,10 +105,11 @@ app/
   layout.tsx                  # root layout + global styles
   globals.css                 # tailwind entry
   api/
-    cron/refresh/route.ts     # cron: rebuild snapshot -> KV
+    cron/refresh/route.ts     # cron: revalidate + rebuild snapshot
     snapshot/route.ts         # public read of cached snapshot
 components/
-  EdgeTable.tsx               # client table w/ sport filters + min-edge slider
+  EdgeTable.tsx               # client table w/ sport filters, min-edge slider,
+                              #   refresh button, diagnostics panel
 lib/
   types.ts                    # shared types
   polymarket.ts               # Gamma Markets client
@@ -114,6 +118,25 @@ lib/
   teams.ts                    # name normalization + fuzzy matching
   match.ts                    # event & side matching
   compare.ts                  # orchestrator
-  kv.ts                       # Vercel KV wrapper
+  cache.ts                    # unstable_cache wrapper (Next.js Data Cache)
 vercel.json                   # cron schedule
 ```
+
+## Debugging
+
+Expand the **Diagnostics** panel at the bottom of the page — it shows counts at each pipeline
+stage (events scanned/kept, Pinnacle events, matches, compared sides, +EV rows), a sample of the
+Polymarket tag slugs we saw, a sample of the sports event titles that made it through the filter,
+any refresh errors, and whether the `ODDS_API_KEY` / `CRON_SECRET` env vars are actually set in
+your runtime environment.
+
+Common failure modes and where to look:
+
+- **`ODDS_API_KEY ✗`** in the env row → add it in Vercel env vars and redeploy.
+- **`polymarket scanned > 0` but `polymarket (sports) == 0`** → the sport-tag filter isn't
+  catching anything. Check `sampleTags` against `SPORT_KEYWORDS` in `lib/polymarket.ts`.
+- **`polymarket (sports) > 0` and `pinnacle events > 0` but `matched == 0`** → name-normalization
+  is too strict. Look at `sampleTitles` vs which Pinnacle team names you expect, then tune
+  `lib/teams.ts` (`CITY_TO_TEAM`, `NOISE_WORDS`).
+- **`compared sides > 0` but `positive edges == 0`** → there genuinely are no +EV rows right now.
+  Polymarket is usually efficient for game winners — real edges tend to appear intermittently.

@@ -1,29 +1,48 @@
-// Cron endpoint: Vercel Cron calls this on a schedule (see vercel.json).
-// It rebuilds the snapshot and writes it to KV. Protected by CRON_SECRET.
+// Cron endpoint: Vercel Cron hits this every 5 min (see vercel.json).
+// It invalidates the cached snapshot and immediately rebuilds it, so the
+// next reader gets fresh data with zero latency.
+//
+// Auth: if CRON_SECRET is set, Vercel Cron automatically sends
+// `Authorization: Bearer <CRON_SECRET>`. We accept that header, OR a
+// `?key=` query param so you can trigger a manual refresh via a plain curl.
 
 import { NextResponse } from "next/server";
-import { buildSnapshot } from "@/lib/compare";
-import { writeSnapshot } from "@/lib/kv";
+import { revalidateTag } from "next/cache";
+import { SNAPSHOT_TAG, getCachedSnapshot } from "@/lib/cache";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
-// Give the function up to 60s to finish fetching both data sources.
 export const maxDuration = 60;
 
 function authorized(req: Request): boolean {
   const secret = process.env.CRON_SECRET;
-  if (!secret) return true; // no secret configured -> no auth enforced (dev)
+  if (!secret) return true; // no secret configured -> allow
   const header = req.headers.get("authorization") ?? "";
-  return header === `Bearer ${secret}`;
+  if (header === `Bearer ${secret}`) return true;
+  const url = new URL(req.url);
+  if (url.searchParams.get("key") === secret) return true;
+  return false;
 }
 
-export async function GET(req: Request) {
+async function handle(req: Request) {
   if (!authorized(req)) {
-    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+    return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
+  }
+  if (!process.env.ODDS_API_KEY) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error:
+          "ODDS_API_KEY is not set. Add it in Vercel → Project Settings → Environment Variables and redeploy.",
+      },
+      { status: 500 },
+    );
   }
   try {
-    const snapshot = await buildSnapshot();
-    await writeSnapshot(snapshot);
+    // Mark the cached snapshot stale, then immediately re-build so the next
+    // reader gets a fresh payload without having to wait for the compute.
+    revalidateTag(SNAPSHOT_TAG);
+    const snapshot = await getCachedSnapshot();
     return NextResponse.json({
       ok: true,
       updatedAt: snapshot.updatedAt,
@@ -38,6 +57,5 @@ export async function GET(req: Request) {
   }
 }
 
-// Also accept POST so you can trigger a refresh from the UI or curl without
-// having to think about method. Same handler.
-export const POST = GET;
+export const GET = handle;
+export const POST = handle;

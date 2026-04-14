@@ -69,10 +69,14 @@ export interface Snapshot {
   /** Diagnostics for the debug panel / logs. */
   stats: {
     polymarketEvents: number;
+    polymarketScanned: number;
     pinnacleEvents: number;
     matchedEvents: number;
     comparedSides: number;
     positiveEdges: number;
+    sampleTags: string[];
+    sampleTitles: string[];
+    buildMs: number;
     errors: string[];
   };
 }

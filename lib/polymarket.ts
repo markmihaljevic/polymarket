@@ -1,51 +1,70 @@
 // Polymarket data source — Gamma Markets API.
 //
-// We call the /events endpoint and filter events whose tag slugs match one of
-// the five tracked sports. Each event contains one or more markets; each
-// market has a set of outcomes and prices. We flatten everything into a list
-// of `PolymarketSide` (one bettable pick) per event.
+// We page through active events and keep the ones that look like sports (by
+// checking tags and, as a fallback, titles). Each event contains one or more
+// markets; each market has outcomes and prices. We flatten everything into a
+// list of `PolymarketSide` (one bettable pick) per event.
 //
-// The Gamma API returns outcomes/outcomePrices/clobTokenIds as stringified
-// JSON — we JSON.parse them defensively.
+// The Gamma API returns `outcomes`/`outcomePrices`/`clobTokenIds` as
+// stringified JSON arrays — we JSON.parse them defensively.
 
 import type { PolymarketEvent, PolymarketSide } from "./types";
 
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 
-// Polymarket tag slugs that correspond to our tracked sports. We keep this
-// deliberately broad because different leagues get their own slugs and the
-// set changes over time; anything we miss will just be absent until added.
-export const POLYMARKET_SPORT_TAG_SLUGS = new Set<string>([
-  "sports",
-  // NFL
+// Permissive substring matcher: if any of these tokens appears in an event's
+// tag slug/label OR in its title, we count it as a sports event. Casting the
+// net wide — over-inclusion here is harmless because the matching step later
+// will only pair events that also have a Pinnacle line.
+const SPORT_KEYWORDS: string[] = [
+  "sport", // catches "sports" and "sports-games" umbrella tags
+  // US leagues
   "nfl",
-  // NBA
   "nba",
-  // NHL
   "nhl",
-  // Tennis (Polymarket doesn't always split by tour)
-  "tennis",
-  "atp",
-  "wta",
-  // Soccer — parent + biggest leagues / competitions
+  "mlb", // not tracked but doesn't hurt — filtered out downstream
+  "mls",
+  "wnba",
+  // General labels
   "soccer",
-  "epl",
+  "football",
+  "basketball",
+  "hockey",
+  "tennis",
+  // Soccer competitions / leagues
+  "premier league",
   "premier-league",
+  "epl",
+  "la liga",
   "la-liga",
   "laliga",
-  "serie-a",
   "bundesliga",
+  "serie a",
+  "serie-a",
+  "seriea",
+  "ligue 1",
   "ligue-1",
   "ligue1",
+  "champions league",
   "champions-league",
-  "uefa-champions-league",
+  "europa league",
   "europa-league",
+  "world cup",
   "world-cup",
-  "euros",
-  "euro-2024",
+  "worldcup",
+  "copa america",
   "copa-america",
-  "mls",
-]);
+  "euros",
+  "euro 2024",
+  "euro-2024",
+  // Tennis tours
+  "atp",
+  "wta",
+  "wimbledon",
+  "roland garros",
+  "us open",
+  "australian open",
+];
 
 interface GammaTag {
   id?: string | number;
@@ -83,16 +102,30 @@ interface GammaEvent {
   markets?: GammaMarket[];
 }
 
+export interface PolymarketFetchResult {
+  events: PolymarketEvent[];
+  /** Diagnostics: everything that makes it past the sports filter. */
+  stats: {
+    totalScanned: number;
+    sportsMatched: number;
+    sampleTags: string[];
+    sampleTitles: string[];
+  };
+}
+
 /**
- * Fetch a page of sports-tagged events from Gamma. We go for the broadest
- * filter (closed=false, active=true, a generous limit) and then filter by tag
- * client-side so we don't miss anything due to tag filter quirks.
+ * Fetch active events from Gamma, filtered to anything that looks like sports.
  */
-export async function fetchPolymarketSportsEvents(): Promise<PolymarketEvent[]> {
+export async function fetchPolymarketSportsEvents(): Promise<PolymarketFetchResult> {
   const events: PolymarketEvent[] = [];
+  const sampleTagSet = new Set<string>();
+  const sampleTitles: string[] = [];
+  let totalScanned = 0;
+
   const pageSize = 200;
-  // Pull up to 600 events. Polymarket sports volume rarely exceeds this at once.
-  for (let offset = 0; offset < 600; offset += pageSize) {
+  const maxEvents = 1000;
+
+  for (let offset = 0; offset < maxEvents; offset += pageSize) {
     const url =
       `${GAMMA_BASE}/events` +
       `?closed=false&active=true` +
@@ -101,33 +134,67 @@ export async function fetchPolymarketSportsEvents(): Promise<PolymarketEvent[]> 
 
     const res = await fetch(url, {
       cache: "no-store",
-      headers: { accept: "application/json" },
+      headers: { accept: "application/json", "user-agent": "polymarket-edge/1.0" },
     });
     if (!res.ok) {
-      throw new Error(`gamma /events failed: ${res.status} ${await res.text()}`);
+      throw new Error(
+        `gamma /events failed: ${res.status} ${await res.text().catch(() => "")}`,
+      );
     }
+
     const page = (await res.json()) as GammaEvent[];
     if (!Array.isArray(page) || page.length === 0) break;
+    totalScanned += page.length;
 
     for (const ev of page) {
+      if (ev.closed === true) continue;
+
+      // Collect tags for the debug panel regardless of whether we keep them.
+      for (const t of ev.tags ?? []) {
+        if (t.slug && sampleTagSet.size < 60) sampleTagSet.add(t.slug.toLowerCase());
+      }
+
+      if (!isSportsEvent(ev)) continue;
       const mapped = mapEvent(ev);
-      if (mapped && isSportsTagged(mapped.tagSlugs)) events.push(mapped);
+      if (!mapped) continue;
+
+      events.push(mapped);
+      if (sampleTitles.length < 15) sampleTitles.push(mapped.title);
     }
+
     if (page.length < pageSize) break;
   }
-  return events;
+
+  return {
+    events,
+    stats: {
+      totalScanned,
+      sportsMatched: events.length,
+      sampleTags: Array.from(sampleTagSet).slice(0, 40),
+      sampleTitles,
+    },
+  };
 }
 
-function isSportsTagged(tagSlugs: string[]): boolean {
-  for (const t of tagSlugs) {
-    if (POLYMARKET_SPORT_TAG_SLUGS.has(t)) return true;
+function isSportsEvent(ev: GammaEvent): boolean {
+  // Tag-based check (primary).
+  for (const t of ev.tags ?? []) {
+    const haystack = `${t.slug ?? ""} ${t.label ?? ""}`.toLowerCase();
+    for (const kw of SPORT_KEYWORDS) {
+      if (haystack.includes(kw)) return true;
+    }
+  }
+  // Fallback: title heuristics for events that came through without the tag
+  // we'd expect.
+  const title = (ev.title ?? "").toLowerCase();
+  for (const kw of SPORT_KEYWORDS) {
+    if (title.includes(kw)) return true;
   }
   return false;
 }
 
 function mapEvent(ev: GammaEvent): PolymarketEvent | null {
   if (!ev.id || !ev.slug || !ev.title) return null;
-  if (ev.closed === true) return null;
 
   const tagSlugs: string[] = [];
   for (const t of ev.tags ?? []) {
@@ -158,9 +225,6 @@ function mapEvent(ev: GammaEvent): PolymarketEvent | null {
         continue;
       }
 
-      // For YES/NO markets, the label to match against Pinnacle is not
-      // literally "Yes" — it's the team the market is asking about. We encode
-      // the question into the label so lib/match.ts can extract it.
       const isBinaryYes =
         outcomes.length === 2 &&
         label.toLowerCase() === "yes" &&
@@ -200,9 +264,7 @@ function parseStringOrArray(v: string | string[] | undefined): string[] | null {
   }
 }
 
-/** Build a user-facing link to the Polymarket market. */
-export function polymarketUrl(eventSlug: string, marketSlug: string): string {
-  // Polymarket's canonical URL is /event/<event-slug>. The market slug is
-  // present as a section/anchor within the event page.
+/** Build a user-facing link to the Polymarket event page. */
+export function polymarketUrl(eventSlug: string, _marketSlug: string): string {
   return `https://polymarket.com/event/${eventSlug}`;
 }

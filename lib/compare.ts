@@ -1,4 +1,4 @@
-// Orchestrator: fetch both sides, match, de-vig, compute edges, return a snapshot.
+// Orchestrator: fetch both sources, match events, de-vig, compute edges, return a snapshot.
 
 import { devigMultiplicative } from "./devig";
 import { matchEvents, matchSides } from "./match";
@@ -16,7 +16,8 @@ export async function buildSnapshot(): Promise<Snapshot> {
     fetchAllPinnacleEvents(),
   ]);
 
-  const pmEvents = pmResult.status === "fulfilled" ? pmResult.value : [];
+  const pmFetch = pmResult.status === "fulfilled" ? pmResult.value : null;
+  const pmEvents = pmFetch?.events ?? [];
   if (pmResult.status === "rejected") {
     errors.push(`polymarket: ${(pmResult.reason as Error)?.message ?? pmResult.reason}`);
   }
@@ -44,8 +45,8 @@ export async function buildSnapshot(): Promise<Snapshot> {
       if (!Number.isFinite(pmPrice) || !Number.isFinite(pinFair)) continue;
       if (pmPrice <= 0 || pmPrice >= 1 || pinFair <= 0 || pinFair >= 1) continue;
 
-      // We only care about rows where Polymarket's price is BELOW Pinnacle's
-      // de-vigged fair probability — i.e., you're buying for less than fair.
+      // Only rows where Polymarket's price is BELOW Pinnacle's de-vigged
+      // fair probability — i.e., you're paying less than fair.
       if (pmPrice >= pinFair) continue;
 
       const edge = pinFair / pmPrice - 1;
@@ -68,9 +69,9 @@ export async function buildSnapshot(): Promise<Snapshot> {
 
   rows.sort((a, b) => b.edge - a.edge);
 
-  const elapsed = Date.now() - startedAt;
+  const buildMs = Date.now() - startedAt;
   console.log(
-    `[compare] pm=${pmEvents.length} pin=${pinEvents.length} matched=${matches.length} compared=${comparedSides} +ev=${rows.length} in ${elapsed}ms`,
+    `[compare] pm=${pmEvents.length}(scanned=${pmFetch?.stats.totalScanned ?? 0}) pin=${pinEvents.length} matched=${matches.length} compared=${comparedSides} +ev=${rows.length} in ${buildMs}ms`,
   );
   if (errors.length) console.warn("[compare] errors:", errors);
 
@@ -79,10 +80,14 @@ export async function buildSnapshot(): Promise<Snapshot> {
     rows,
     stats: {
       polymarketEvents: pmEvents.length,
+      polymarketScanned: pmFetch?.stats.totalScanned ?? 0,
       pinnacleEvents: pinEvents.length,
       matchedEvents: matches.length,
       comparedSides,
       positiveEdges: rows.length,
+      sampleTags: pmFetch?.stats.sampleTags ?? [],
+      sampleTitles: pmFetch?.stats.sampleTitles ?? [],
+      buildMs,
       errors,
     },
   };

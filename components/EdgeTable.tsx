@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { EdgeRow, Snapshot, SportGroup } from "@/lib/types";
 import { TRACKED_SPORT_GROUPS } from "@/lib/types";
 
@@ -14,39 +14,88 @@ const SPORT_LABELS: Record<SportGroup, string> = {
 
 const MIN_EDGE_DEFAULT = Number(process.env.NEXT_PUBLIC_MIN_EDGE ?? "0.02");
 
+interface SnapshotResponse {
+  ok: boolean;
+  snapshot?: Snapshot;
+  error?: string;
+  diag?: {
+    hasOddsApiKey: boolean;
+    hasCronSecret: boolean;
+    vercelEnv: string | null;
+    region: string | null;
+    nodeEnv: string | null;
+  };
+}
+
 export function EdgeTable() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  const [diag, setDiag] = useState<SnapshotResponse["diag"] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
   const [minEdge, setMinEdge] = useState<number>(MIN_EDGE_DEFAULT);
   const [enabledSports, setEnabledSports] = useState<Set<SportGroup>>(
     () => new Set(TRACKED_SPORT_GROUPS),
   );
 
-  // Poll the snapshot every 30s so the page stays current without a reload.
+  const loadSnapshot = useCallback(async () => {
+    try {
+      const res = await fetch("/api/snapshot", { cache: "no-store" });
+      const json = (await res.json()) as SnapshotResponse;
+      if (json.diag) setDiag(json.diag);
+      if (json.ok && json.snapshot) {
+        setSnapshot(json.snapshot);
+        setError(null);
+      } else {
+        setError(json.error ?? "failed to load snapshot");
+      }
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }, []);
+
+  // Initial load + polling every 60s.
   useEffect(() => {
     let cancelled = false;
-    async function load() {
-      try {
-        const res = await fetch("/api/snapshot", { cache: "no-store" });
-        const json = await res.json();
-        if (cancelled) return;
-        if (json.ok) {
-          setSnapshot(json.snapshot);
-          setError(null);
-        } else {
-          setError(json.error ?? "failed to load snapshot");
-        }
-      } catch (e) {
-        if (!cancelled) setError((e as Error).message);
-      }
-    }
-    load();
-    const id = setInterval(load, 30_000);
+    (async () => {
+      if (!cancelled) await loadSnapshot();
+    })();
+    const id = setInterval(() => {
+      if (!cancelled) loadSnapshot();
+    }, 60_000);
     return () => {
       cancelled = true;
       clearInterval(id);
     };
-  }, []);
+  }, [loadSnapshot]);
+
+  const forceRefresh = useCallback(async () => {
+    setRefreshing(true);
+    setError(null);
+    try {
+      // Trigger a rebuild via the cron endpoint. If CRON_SECRET is set, this
+      // will 401 unless the user has it — in that case we still re-poll the
+      // snapshot, which will have been refreshed by Vercel's cron anyway.
+      const res = await fetch("/api/cron/refresh", {
+        method: "POST",
+        cache: "no-store",
+      });
+      const json = await res.json();
+      if (!res.ok) {
+        if (res.status === 401) {
+          setError(
+            "Manual refresh requires CRON_SECRET. Either unset it, or curl the endpoint with the Authorization header. Auto-polling continues.",
+          );
+        } else {
+          setError(json.error ?? `refresh failed: ${res.status}`);
+        }
+      }
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      await loadSnapshot();
+      setRefreshing(false);
+    }
+  }, [loadSnapshot]);
 
   const visibleRows = useMemo(() => {
     if (!snapshot) return [] as EdgeRow[];
@@ -66,7 +115,7 @@ export function EdgeTable() {
 
   return (
     <div className="mx-auto max-w-6xl px-6 py-10">
-      <header className="mb-6 flex items-baseline justify-between">
+      <header className="mb-6 flex items-start justify-between gap-6">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">
             Polymarket vs Pinnacle
@@ -76,9 +125,9 @@ export function EdgeTable() {
             fair price.
           </p>
         </div>
-        <div className="text-right text-xs text-neutral-500">
+        <div className="flex flex-col items-end gap-2 text-right text-xs text-neutral-500">
           {snapshot && (
-            <>
+            <div>
               Updated{" "}
               <time dateTime={snapshot.updatedAt}>
                 {new Date(snapshot.updatedAt).toLocaleTimeString()}
@@ -87,8 +136,15 @@ export function EdgeTable() {
               {snapshot.stats.polymarketEvents} PM ·{" "}
               {snapshot.stats.pinnacleEvents} Pinnacle ·{" "}
               {snapshot.stats.matchedEvents} matched
-            </>
+            </div>
           )}
+          <button
+            onClick={forceRefresh}
+            disabled={refreshing}
+            className="rounded-md border border-neutral-700 bg-neutral-900 px-3 py-1 text-xs text-neutral-200 hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {refreshing ? "Refreshing…" : "Refresh now"}
+          </button>
         </div>
       </header>
 
@@ -130,7 +186,15 @@ export function EdgeTable() {
 
       {error && (
         <div className="mb-4 rounded-md border border-amber-600/40 bg-amber-950/30 p-3 text-sm text-amber-300">
-          {error}
+          <div className="font-medium">Snapshot error</div>
+          <div className="mt-1 font-mono text-xs">{error}</div>
+          {diag && (
+            <div className="mt-2 text-xs text-amber-400/80">
+              env: ODDS_API_KEY={diag.hasOddsApiKey ? "✓" : "✗"} · CRON_SECRET=
+              {diag.hasCronSecret ? "✓" : "✗"} · vercel={diag.vercelEnv ?? "?"}{" "}
+              · region={diag.region ?? "?"}
+            </div>
+          )}
         </div>
       )}
 
@@ -141,7 +205,7 @@ export function EdgeTable() {
       )}
 
       {snapshot && visibleRows.length === 0 && (
-        <div className="py-20 text-center text-sm text-neutral-500">
+        <div className="py-16 text-center text-sm text-neutral-500">
           No +EV markets right now matching your filters.
         </div>
       )}
@@ -212,18 +276,68 @@ export function EdgeTable() {
         </div>
       )}
 
-      {snapshot?.stats.errors && snapshot.stats.errors.length > 0 && (
+      {snapshot && (
         <details className="mt-6 text-xs text-neutral-500">
-          <summary className="cursor-pointer">
-            {snapshot.stats.errors.length} warning(s) during last refresh
-          </summary>
-          <ul className="mt-2 space-y-1">
-            {snapshot.stats.errors.map((e, i) => (
-              <li key={i} className="font-mono">
-                {e}
-              </li>
-            ))}
-          </ul>
+          <summary className="cursor-pointer">Diagnostics</summary>
+          <div className="mt-3 space-y-2 rounded-md border border-neutral-800 bg-neutral-900/30 p-3">
+            <div className="grid grid-cols-2 gap-x-4 gap-y-1 font-mono">
+              <span>polymarket scanned</span>
+              <span>{snapshot.stats.polymarketScanned}</span>
+              <span>polymarket (sports)</span>
+              <span>{snapshot.stats.polymarketEvents}</span>
+              <span>pinnacle events</span>
+              <span>{snapshot.stats.pinnacleEvents}</span>
+              <span>matched events</span>
+              <span>{snapshot.stats.matchedEvents}</span>
+              <span>compared sides</span>
+              <span>{snapshot.stats.comparedSides}</span>
+              <span>positive edges</span>
+              <span>{snapshot.stats.positiveEdges}</span>
+              <span>build time</span>
+              <span>{snapshot.stats.buildMs}ms</span>
+            </div>
+            {snapshot.stats.sampleTags.length > 0 && (
+              <div>
+                <div className="mt-2 font-medium text-neutral-400">
+                  sample tag slugs seen on Polymarket
+                </div>
+                <div className="mt-1 font-mono text-[10px] text-neutral-500">
+                  {snapshot.stats.sampleTags.join(" · ")}
+                </div>
+              </div>
+            )}
+            {snapshot.stats.sampleTitles.length > 0 && (
+              <div>
+                <div className="mt-2 font-medium text-neutral-400">
+                  sample sports event titles
+                </div>
+                <ul className="mt-1 list-disc pl-4 text-[11px] text-neutral-500">
+                  {snapshot.stats.sampleTitles.map((t, i) => (
+                    <li key={i}>{t}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {snapshot.stats.errors.length > 0 && (
+              <div>
+                <div className="mt-2 font-medium text-amber-400">
+                  {snapshot.stats.errors.length} warning(s) during last refresh
+                </div>
+                <ul className="mt-1 list-disc pl-4 font-mono text-[10px] text-amber-300/80">
+                  {snapshot.stats.errors.map((e, i) => (
+                    <li key={i}>{e}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {diag && (
+              <div className="mt-2 text-[11px] text-neutral-600">
+                env: ODDS_API_KEY={diag.hasOddsApiKey ? "✓" : "✗"} · CRON_SECRET=
+                {diag.hasCronSecret ? "✓" : "✗"} · vercel={diag.vercelEnv ?? "?"}{" "}
+                · region={diag.region ?? "?"}
+              </div>
+            )}
+          </div>
         </details>
       )}
     </div>
