@@ -12,22 +12,20 @@ import type { PolymarketEvent, PolymarketSide } from "./types";
 
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 
-// Permissive substring matcher: if any of these tokens appears in an event's
-// tag slug/label OR in its title, we count it as a sports event. Casting the
-// net wide — over-inclusion here is harmless because the matching step later
-// will only pair events that also have a Pinnacle line.
+// Narrower substring matcher — deliberately does NOT include bare "sport"
+// because the "sports" umbrella tag on Polymarket also covers MLB, F1, UFC,
+// chess, etc., and we'd end up scanning them for nothing. The patterns below
+// all target one of our five tracked sports (NFL, NBA, NHL, Soccer, Tennis).
 const SPORT_KEYWORDS: string[] = [
-  "sport", // catches "sports" and "sports-games" umbrella tags
   // US leagues
   "nfl",
   "nba",
   "nhl",
-  "mlb", // not tracked but doesn't hurt — filtered out downstream
   "mls",
   "wnba",
-  // General labels
+  // Generic sports labels (these are specific enough to avoid false positives)
   "soccer",
-  "football",
+  "football", // matches american-football / fantasy-football too — fine
   "basketball",
   "hockey",
   "tennis",
@@ -52,18 +50,20 @@ const SPORT_KEYWORDS: string[] = [
   "world cup",
   "world-cup",
   "worldcup",
+  "fifa",
+  "uefa",
   "copa america",
   "copa-america",
-  "euros",
-  "euro 2024",
-  "euro-2024",
-  // Tennis tours
+  // Tennis tours and slams
   "atp",
   "wta",
   "wimbledon",
   "roland garros",
+  "roland-garros",
   "us open",
+  "us-open",
   "australian open",
+  "australian-open",
 ];
 
 interface GammaTag {
@@ -148,15 +148,15 @@ export async function fetchPolymarketSportsEvents(): Promise<PolymarketFetchResu
 
     for (const ev of page) {
       if (ev.closed === true) continue;
-
-      // Collect tags for the debug panel regardless of whether we keep them.
-      for (const t of ev.tags ?? []) {
-        if (t.slug && sampleTagSet.size < 60) sampleTagSet.add(t.slug.toLowerCase());
-      }
-
       if (!isSportsEvent(ev)) continue;
       const mapped = mapEvent(ev);
       if (!mapped) continue;
+
+      // Sample tags/titles come only from events we actually kept, so the
+      // diagnostics panel reflects what the pipeline sees downstream.
+      for (const t of ev.tags ?? []) {
+        if (t.slug && sampleTagSet.size < 40) sampleTagSet.add(t.slug.toLowerCase());
+      }
 
       events.push(mapped);
       if (sampleTitles.length < 15) sampleTitles.push(mapped.title);
@@ -177,18 +177,11 @@ export async function fetchPolymarketSportsEvents(): Promise<PolymarketFetchResu
 }
 
 function isSportsEvent(ev: GammaEvent): boolean {
-  // Tag-based check (primary).
   for (const t of ev.tags ?? []) {
     const haystack = `${t.slug ?? ""} ${t.label ?? ""}`.toLowerCase();
     for (const kw of SPORT_KEYWORDS) {
       if (haystack.includes(kw)) return true;
     }
-  }
-  // Fallback: title heuristics for events that came through without the tag
-  // we'd expect.
-  const title = (ev.title ?? "").toLowerCase();
-  for (const kw of SPORT_KEYWORDS) {
-    if (title.includes(kw)) return true;
   }
   return false;
 }

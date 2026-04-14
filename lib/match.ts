@@ -1,23 +1,20 @@
 // Event and side matching between Polymarket and Pinnacle.
 //
-// The problem: Polymarket event titles, market questions and outcome labels
-// are free-form prose; Pinnacle (via The Odds API) gives us clean
-// (home_team, away_team, commence_time) tuples. We need to pair them up so
-// we can compare a Polymarket price to a Pinnacle fair price for the same
-// underlying pick.
+// Two distinct flavors:
 //
-// Strategy:
-//   1. For each PinnacleEvent, find PolymarketEvents whose title (or any side
-//      label / question) mentions BOTH home and away teams and whose start
-//      time is within ±6h.
-//   2. For each Polymarket side in that event, figure out which Pinnacle
-//      outcome it corresponds to:
-//         - If the side is a @Q:-prefixed YES/NO, use teams.extractYesSide.
-//         - Otherwise, score the label against each Pinnacle outcome name
-//           and pick the best if the similarity is clearly high.
+// - **h2h matching**: Pinnacle gives us (home, away, commence_time). We find
+//   a Polymarket event whose title / market questions mention BOTH teams
+//   and whose start time is within ±6h. Each Polymarket side is then
+//   resolved to one of Pinnacle's outcome keys.
+//
+// - **outright matching**: Pinnacle gives us a season/tournament outright
+//   with N entrants. We find a Polymarket event that looks like a futures
+//   market (title contains "Winner", "Champion", "MVP", etc.) and whose
+//   name fuzzy-matches the Pinnacle tournament name. Each Polymarket side
+//   is resolved to one of the outright outcomes.
 
 import type { PinnacleEvent, PolymarketEvent, PolymarketSide } from "./types";
-import { extractYesSide, nameSimilarity, tokenSet } from "./teams";
+import { extractYesSide, nameSimilarity } from "./teams";
 
 const TIME_WINDOW_MS = 6 * 60 * 60 * 1000; // ±6h
 
@@ -34,12 +31,17 @@ export interface SideMatch {
   displayLabel: string;
 }
 
+// ==========================================================================
+// h2h matching
+// ==========================================================================
+
 export function matchEvents(
   pmEvents: PolymarketEvent[],
   pinEvents: PinnacleEvent[],
 ): EventMatch[] {
   const matches: EventMatch[] = [];
   for (const pin of pinEvents) {
+    if (pin.isOutright) continue;
     const pinTime = Date.parse(pin.commenceTime);
     if (!Number.isFinite(pinTime)) continue;
 
@@ -56,8 +58,8 @@ export function matchEvents(
 }
 
 function dedupe(matches: EventMatch[]): EventMatch[] {
-  // If two Pinnacle events matched the same Polymarket event, keep only the
-  // one with a closer start time — otherwise we'd double-count rows.
+  // If two Pinnacle events matched the same Polymarket event, keep the one
+  // with a closer start time.
   const byPmId = new Map<string, EventMatch>();
   for (const m of matches) {
     const existing = byPmId.get(m.pm.id);
@@ -80,11 +82,6 @@ function eventTimeClose(pmStart: string | undefined, pinTime: number): boolean {
   return Math.abs(pmT - pinTime) <= TIME_WINDOW_MS;
 }
 
-/**
- * Score a (pm event, pinnacle event) pair from 0..1 based on whether both
- * team names appear anywhere in the Polymarket event's title or in its
- * market questions / outcome labels.
- */
 function scoreEventPair(pm: PolymarketEvent, pin: PinnacleEvent): number {
   const haystack = [
     pm.title,
@@ -95,14 +92,9 @@ function scoreEventPair(pm: PolymarketEvent, pin: PinnacleEvent): number {
   const awayScore = nameSimilarity(haystack, pin.awayTeam);
   if (homeScore < 0.5 || awayScore < 0.5) return 0;
 
-  // Both teams mentioned — blend: require both strong, reward strength.
   return Math.min(homeScore, awayScore) * 0.7 + ((homeScore + awayScore) / 2) * 0.3;
 }
 
-/**
- * For a matched event, resolve each Polymarket side to a Pinnacle outcome key.
- * Sides we can't confidently resolve are dropped.
- */
 export function matchSides(match: EventMatch): SideMatch[] {
   const { pm, pin } = match;
   const out: SideMatch[] = [];
@@ -119,10 +111,9 @@ export function matchSides(match: EventMatch): SideMatch[] {
       continue;
     }
 
-    // Multi-outcome market: the label itself is the team (or "Draw").
     const key = bestOutcomeKey(pinKeys, side.label);
     if (!key) continue;
-    out.push({ pmSide: side, pinOutcomeKey: key, displayLabel: pin.outcomes[key] ? key : side.label });
+    out.push({ pmSide: side, pinOutcomeKey: key, displayLabel: key });
   }
 
   return out;
@@ -131,7 +122,6 @@ export function matchSides(match: EventMatch): SideMatch[] {
 function bestOutcomeKey(keys: string[], target: string): string | null {
   if (keys.length === 0) return null;
 
-  // "Draw" is a special case in soccer.
   const normalized = target.toLowerCase().trim();
   if (normalized === "draw" || normalized === "tie") {
     const draw = keys.find((k) => k.toLowerCase() === "draw");
@@ -140,7 +130,6 @@ function bestOutcomeKey(keys: string[], target: string): string | null {
 
   let best: { key: string; score: number } | null = null;
   for (const k of keys) {
-    // Never match "Draw" against a team.
     if (k.toLowerCase() === "draw") continue;
     const score = nameSimilarity(k, target);
     if (score < 0.5) continue;
@@ -149,5 +138,67 @@ function bestOutcomeKey(keys: string[], target: string): string | null {
   return best?.key ?? null;
 }
 
-// Export for tests / debugging
-export const __test = { scoreEventPair, bestOutcomeKey, tokenSet };
+// ==========================================================================
+// Outright matching
+// ==========================================================================
+
+// Matches titles like "2026 NBA Champion", "English Premier League Winner",
+// "NBA MVP", "Stanley Cup Winner", "World Series Champion 2026", etc.
+const OUTRIGHT_TITLE_RE = /\b(winner|champion|champs|finals?|title|mvp|trophy)\b/i;
+
+export function matchOutrights(
+  pmEvents: PolymarketEvent[],
+  pinEvents: PinnacleEvent[],
+): EventMatch[] {
+  const outrights = pinEvents.filter((e) => e.isOutright);
+  if (outrights.length === 0) return [];
+
+  const matches: EventMatch[] = [];
+  const seenPmIds = new Set<string>();
+
+  for (const pm of pmEvents) {
+    if (seenPmIds.has(pm.id)) continue;
+    if (!OUTRIGHT_TITLE_RE.test(pm.title)) continue;
+
+    let best: { pin: PinnacleEvent; score: number } | null = null;
+    for (const pin of outrights) {
+      const tournament = pin.tournamentName || pin.sportKey;
+      // Symmetric name similarity: both directions matter because PM titles
+      // are typically longer ("2026 NBA Champion") than Pinnacle's
+      // ("NBA Championship Winner").
+      const s1 = nameSimilarity(pm.title, tournament);
+      const s2 = nameSimilarity(tournament, pm.title);
+      const score = Math.max(s1, s2);
+      if (score < 0.5) continue;
+      if (!best || score > best.score) best = { pin, score };
+    }
+    if (best) {
+      matches.push({ pm, pin: best.pin });
+      seenPmIds.add(pm.id);
+    }
+  }
+  return matches;
+}
+
+/** For a matched outright pair, resolve each PM side to one Pinnacle outcome. */
+export function matchOutrightSides(match: EventMatch): SideMatch[] {
+  const { pm, pin } = match;
+  const out: SideMatch[] = [];
+  const pinKeys = Object.keys(pin.outcomes);
+
+  for (const side of pm.sides) {
+    const searchText = side.label.startsWith("@Q:")
+      ? side.label.slice(3)
+      : side.label;
+
+    let best: { key: string; score: number } | null = null;
+    for (const key of pinKeys) {
+      const score = nameSimilarity(searchText, key);
+      if (score < 0.6) continue; // tighter threshold — outrights have many lookalike names
+      if (!best || score > best.score) best = { key, score };
+    }
+    if (!best) continue;
+    out.push({ pmSide: side, pinOutcomeKey: best.key, displayLabel: best.key });
+  }
+  return out;
+}

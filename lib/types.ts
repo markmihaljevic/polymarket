@@ -19,9 +19,15 @@ export interface PinnacleEvent {
   commenceTime: string; // ISO
   homeTeam: string;
   awayTeam: string;
-  /** h2h outcomes as decimal odds keyed by the outcome name as returned by the API.
-   *  For soccer, a "Draw" key may also be present. */
+  /**
+   * For h2h: {home_team: price, away_team: price, ...optional "Draw": price}.
+   * For outrights: {team_or_player_name: price, ...} with many entries.
+   */
   outcomes: Record<string, number>;
+  /** True if this is a tournament / season-long futures market. */
+  isOutright?: boolean;
+  /** Human-readable tournament name — used for outright matching. */
+  tournamentName?: string;
 }
 
 /** One side (outcome) of a Polymarket market that maps to a single bettable pick. */
@@ -61,6 +67,8 @@ export interface EdgeRow {
   pinFairDecimal: number;
   edge: number;         // pinFairProb / pmPrice - 1
   polymarketUrl: string;
+  /** "h2h" for a game line, "outright" for a tournament futures pick. */
+  kind: "h2h" | "outright";
 }
 
 export interface Snapshot {
@@ -70,7 +78,11 @@ export interface Snapshot {
   stats: {
     polymarketEvents: number;
     polymarketScanned: number;
-    pinnacleEvents: number;
+    pinnacleH2hEvents: number;
+    pinnacleOutrightEvents: number;
+    pinnacleSportsFetched: number;
+    h2hMatches: number;
+    outrightMatches: number;
     matchedEvents: number;
     comparedSides: number;
     positiveEdges: number;

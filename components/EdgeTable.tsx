@@ -134,7 +134,9 @@ export function EdgeTable() {
               </time>
               <br />
               {snapshot.stats.polymarketEvents} PM ·{" "}
-              {snapshot.stats.pinnacleEvents} Pinnacle ·{" "}
+              {snapshot.stats.pinnacleH2hEvents +
+                snapshot.stats.pinnacleOutrightEvents}{" "}
+              Pinnacle ·{" "}
               {snapshot.stats.matchedEvents} matched
             </div>
           )}
@@ -232,7 +234,17 @@ export function EdgeTable() {
                   className="border-t border-neutral-800/70 hover:bg-neutral-900/30"
                 >
                   <td className="px-4 py-3 text-neutral-400">
-                    {SPORT_LABELS[r.sport]}
+                    <div className="flex items-center gap-1.5">
+                      <span>{SPORT_LABELS[r.sport]}</span>
+                      {r.kind === "outright" && (
+                        <span
+                          title="Tournament / season futures market"
+                          className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wider text-amber-400"
+                        >
+                          fut
+                        </span>
+                      )}
+                    </div>
                   </td>
                   <td className="px-4 py-3 text-neutral-200">{r.eventTitle}</td>
                   <td className="px-4 py-3 text-neutral-200">{r.side}</td>
@@ -285,10 +297,16 @@ export function EdgeTable() {
               <span>{snapshot.stats.polymarketScanned}</span>
               <span>polymarket (sports)</span>
               <span>{snapshot.stats.polymarketEvents}</span>
-              <span>pinnacle events</span>
-              <span>{snapshot.stats.pinnacleEvents}</span>
-              <span>matched events</span>
-              <span>{snapshot.stats.matchedEvents}</span>
+              <span>pinnacle sports fetched</span>
+              <span>{snapshot.stats.pinnacleSportsFetched}</span>
+              <span>pinnacle h2h events</span>
+              <span>{snapshot.stats.pinnacleH2hEvents}</span>
+              <span>pinnacle outright events</span>
+              <span>{snapshot.stats.pinnacleOutrightEvents}</span>
+              <span>h2h matches</span>
+              <span>{snapshot.stats.h2hMatches}</span>
+              <span>outright matches</span>
+              <span>{snapshot.stats.outrightMatches}</span>
               <span>compared sides</span>
               <span>{snapshot.stats.comparedSides}</span>
               <span>positive edges</span>
